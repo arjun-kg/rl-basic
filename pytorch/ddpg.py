@@ -9,7 +9,7 @@ from copy import deepcopy
 import pdb 
 
 #environment name 
-env_name = 'MountainCarContinuous-v0'
+env_name = 'Pendulum-v0'
 
 #random seed
 np.random.seed(1)
@@ -22,13 +22,14 @@ models_path = './models/ddpg_actor.pkl'
 num_episodes = 1000
 num_steps = 1000
 train_batch_size = 64
-noise_factor = 0.01
+noise_factor = 0.01 #gaussian noise added to output of actor network 
 eps_start = 0.5
 T = 100000 #Temperature for epsilon decay
-gamma = 0.99
+gamma = 0.99 
 tau = 0.001 #target nets are updated by: theta_target <- tau*theta_current + (1-tau)*theta_target
-hidden_layer_size = 128 #all hidden layer sizes in all networks are the same
-lr = 0.0001 #optimizer's learning rate
+hidden_layer_size = 256 #all hidden layer sizes in all networks are the same
+lr_actor = 0.0001 #actor optimizer's learning rate
+lr_critic = 0.001 #critic optimizer's learning rate
 
 class ReplayBuffer:
     def __init__(self,buffer_size=1000000):
@@ -84,19 +85,19 @@ def train_step(actor_net,critic_net,actor_target_net,critic_target_net,
     critic_values = critic_net(critic_net_inputs)
     
     critic_loss = F.smooth_l1_loss(critic_values,critic_target.detach())
-    optimizers[0].zero_grad()
+    optimizers[1].zero_grad()
     critic_loss.backward()
     
     #clipping gradients     
     for param in critic_net.parameters():
         param.grad.data.clamp_(-1, 1)
-    optimizers[0].step()
+    optimizers[1].step()
 
     #Updating actor net
     actions_from_actor = actor_net(states)
     critic_net_inputs2 = torch.cat([states,actions_from_actor],dim=-1)
     actor_loss = - critic_net(critic_net_inputs2).mean()
-    optimizers[1].zero_grad()
+    optimizers[0].zero_grad()
     actor_loss.backward()
     
     #clipping gradients     
@@ -145,13 +146,14 @@ if __name__ == "__main__":
     critic_target_net.eval()
     
     memory = ReplayBuffer()
-    optimizers = [optim.Adam(actor_net.parameters(),lr=lr),
-                  optim.Adam(critic_net.parameters(),lr=lr)]
+    optimizers = [optim.Adam(actor_net.parameters(),lr=lr_actor),
+                  optim.Adam(critic_net.parameters(),lr=lr_critic)]
     
     total_timesteps = 0
     
     for ep in range(num_episodes):
         state = env.reset()
+        ep_reward = 0
         for st in range(num_steps):
             greedy_action = actor_net(torch.tensor(state).float()).detach().numpy()
             action = add_noise(greedy_action,total_timesteps,
@@ -164,7 +166,8 @@ if __name__ == "__main__":
                 train_step(actor_net,critic_net,actor_target_net,critic_target_net,
                            memory,optimizers)
             total_timesteps += 1
-#            env.render()
-            if done:
-                print("Steps in episode {}: {}".format(ep,st))
+            ep_reward += reward
+            # env.render()
+            if done or st == num_steps-1:
+                print("Episode: {}, Steps: {}, Reward: {}".format(ep,st, ep_reward))
                 break
