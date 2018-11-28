@@ -4,7 +4,6 @@ import torch.optim as optim
 import torch.nn.functional as F 
 import gym 
 import numpy as np 
-from tqdm import tqdm 
 from copy import deepcopy
 import pdb 
 from matplotlib import pyplot as plt 
@@ -13,7 +12,7 @@ from matplotlib import pyplot as plt
 np.random.seed(1)
 
 #environment name 
-env_name = 'CartPole-v1'
+env_name = 'MountainCar-v0'
 
 #hyperparameters
 num_episodes = 1000
@@ -21,9 +20,9 @@ num_steps = 500
 eps_init = 0.5
 T = 10000 #temperature for epsilon-decay 
 train_batch_size = 50
-gamma = 0.99
+gamma = 0.9
 target_update_freq = 10
-
+    
 class ReplayBuffer:
     def __init__(self,buffer_size=10000):
         self.buffer_size = buffer_size
@@ -66,7 +65,7 @@ def plotter(r):
     plt.plot(r)
     plt.show()
 
-def train(policy_net,target_net,memory,optimizer):
+def train_step(policy_net,target_net,memory,optimizer):
     if train_batch_size > len(memory.buffer):
         return
     batch = memory.sample(train_batch_size)
@@ -74,9 +73,11 @@ def train(policy_net,target_net,memory,optimizer):
     actions = torch.tensor([batch[i][1] for i in range(len(batch))]).view(-1,1)
     rewards = torch.tensor([batch[i][2] for i in range(len(batch))])
     next_states = torch.tensor([batch[i][3] for i in range(len(batch))]).float()
+    dones = torch.tensor([batch[i][4] for i in range(len(batch))]).float()
+        
     state_values = policy_net(states).gather(1,actions).view(-1)
     max_next_state_values = target_net(next_states).max(1)[0].detach()
-    expected_state_values = rewards + gamma*max_next_state_values
+    expected_state_values = rewards + gamma*max_next_state_values*(1-dones)
     
     #loss
     loss = F.smooth_l1_loss(state_values,expected_state_values)
@@ -111,19 +112,19 @@ if __name__ == '__main__':
         
         state = env.reset()
         episode_rewards.append(0)
-        for _ in range(num_steps):
+        for st in range(num_steps):
             greedy_action = policy_net(torch.tensor(state).float()).max(0)[1].item()
             action = eps_greedy(greedy_action,env.action_space.n,total_timesteps)
             next_state,reward,done,_ = env.step(action)
-            if done:
-                break
-            transition_tuple = (state,action,reward,next_state)
+            transition_tuple = (state,action,reward,next_state,done)
             memory.push(transition_tuple)
-            train(policy_net,target_net,memory,optimizer)
+            train_step(policy_net,target_net,memory,optimizer)
             state = next_state
             episode_rewards[ep] += reward
             total_timesteps += 1
             if total_timesteps % target_update_freq == 0:
                 target_net.load_state_dict(policy_net.state_dict())
-            env.render()
-        plotter(episode_rewards)
+            if done:
+                print("Steps in episode {}: {}".format(ep,st))
+                break
+#            env.render()
