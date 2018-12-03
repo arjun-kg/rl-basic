@@ -88,7 +88,7 @@ def train_step(actor_net,critic_net,actor_target_net,critic_target_net,
     critic_net_inputs = torch.cat([states,actions],dim=-1)
     critic_values = critic_net(critic_net_inputs)
     
-    critic_loss = F.smooth_l1_loss(critic_values,critic_target.detach())
+    critic_loss = F.mse_loss(critic_values,critic_target.detach())
     optimizers[1].zero_grad()
     critic_loss.backward()
     
