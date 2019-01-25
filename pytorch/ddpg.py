@@ -10,6 +10,9 @@ import random
 from copy import deepcopy
 import pdb 
 import time
+import tensorflow as tf 
+
+from parallelize_env_wrapper import ParallelizeEnv
 
 torch.set_default_tensor_type(torch.DoubleTensor)
 
@@ -31,17 +34,17 @@ models_path = './models/ddpg_actor.pkl'
 hyperparam_search_mode = False
 
 #hyperparameters
-max_timesteps = 100000
+max_timesteps = 1000000
 num_steps = 1000
-train_batch_size = 64
+train_batch_size = 128
 noise_factor = 0.001 #gaussian noise added to output of actor network 
-eps_start = 0.3
+eps_start = 0.8
 T = 200000 #Temperature for epsilon decay
 gamma = 0.99 
 tau = 0.001 #target nets are updated by: theta_target <- tau*theta_current + (1-tau)*theta_target
 hidden_layer_size = 256 #all hidden layer sizes in all networks are the same
-lr_actor = 0.0001 #actor optimizer's learning rate
-lr_critic = 0.001 #critic optimizer's learning rate
+lr_actor = 1e-4 #actor optimizer's learning rate
+lr_critic = 1e-3 #critic optimizer's learning rate
 
 class ReplayBuffer:
     def __init__(self,buffer_size=1000000):
@@ -49,13 +52,19 @@ class ReplayBuffer:
         self.buffer = []
         self.position = 0
     
-    def push(self,*args):
+    def push(self,s,a,r,ns,d):
 
-        transition = Transition(*args)
+        transitions_list = [Transition(a,b,c,d,e) for a,b,c,d,e in zip(s,a,r,ns,d)]
         if len(self.buffer) < self.buffer_size:
             self.buffer.append(None)
-        self.buffer[self.position] = transition
-        self.position = (self.position + 1)%self.buffer_size
+        list_len = len(transitions_list)
+
+        if list_len + self.position > self.buffer_size:
+            self.buffer[self.position:self.buffer_size] = transitions_list[:self.buffer_size-self.position]
+            self.buffer[:list_len-self.buffer_size+self.position] = transitions_list[list_len-self.buffer_size+self.position:]
+        else:
+            self.buffer[self.position:self.position+list_len] = transitions_list
+        self.position = (self.position + list_len)%self.buffer_size
     
     def sample(self,n):
         return random.sample(self.buffer, n)
@@ -64,20 +73,25 @@ class ReplayBuffer:
         return len(self.buffer)
 
 class DDPG_Actor(nn.Module):
-    def __init__(self,input_size,output_size):
+    def __init__(self,input_size,output_size,action_space_high):
         super(DDPG_Actor,self).__init__()
+
+        self.action_space_high = action_space_high
         self.lin1 = nn.Linear(input_size,hidden_layer_size)
         self.lin2 = nn.Linear(hidden_layer_size,hidden_layer_size)
-        self.lin3 = nn.Linear(hidden_layer_size,output_size)
-        self.lin3.weight.data.uniform_(-1e-2,1e-2)
+        self.lin3 = nn.Linear(hidden_layer_size,hidden_layer_size)
+        self.lin4 = nn.Linear(hidden_layer_size,output_size)
+        self.lin4.weight.data.uniform_(-1e-2,1e-2)
 
         self.ln1 = nn.LayerNorm(hidden_layer_size)
         self.ln2 = nn.LayerNorm(hidden_layer_size)
+        self.ln3 = nn.LayerNorm(hidden_layer_size)
         
     def forward(self,x):
         x = F.relu(self.ln1(self.lin1(x)))
         x = F.relu(self.ln2(self.lin2(x)))
-        x = torch.tanh(self.lin3(x))
+        x = F.relu(self.ln3(self.lin3(x)))
+        x = torch.tanh(self.lin4(x))*torch.tensor(self.action_space_high).double()
         return x
 
 class DDPG_Critic(nn.Module):
@@ -85,17 +99,20 @@ class DDPG_Critic(nn.Module):
         super(DDPG_Critic,self).__init__()
         self.lin1 = nn.Linear(state_size,hidden_layer_size)
         self.lin2 = nn.Linear(hidden_layer_size + action_size,hidden_layer_size)
-        self.lin3 = nn.Linear(hidden_layer_size,output_size)
-        self.lin3.weight.data.uniform_(-1e-2,1e-2)
+        self.lin3 = nn.Linear(hidden_layer_size,hidden_layer_size)
+        self.lin4 = nn.Linear(hidden_layer_size,output_size)
+        self.lin4.weight.data.uniform_(-1e-2,1e-2)
 
         self.ln1 = nn.LayerNorm(hidden_layer_size)
         self.ln2 = nn.LayerNorm(hidden_layer_size)
+        self.ln3 = nn.LayerNorm(hidden_layer_size)
         
     def forward(self,state,action):
         x = F.relu(self.ln1(self.lin1(state)))
         x = torch.cat((x,action),dim=-1)
         x = F.relu(self.ln2(self.lin2(x)))
-        x = self.lin3(x)
+        x = F.relu(self.ln3(self.lin3(x)))
+        x = self.lin4(x)
         return x
 
 class StateNormalizer: 
@@ -118,17 +135,15 @@ class StateNormalizer:
         self.M2 += delta*delta2
         self.std = np.sqrt(self.M2/np.maximum((self.count-1),1e-3))
 
-        return (x-self.mean)/self.std
-
 
 class ParameterSpaceNoise:
-    def __init__(self,init_std=0.1, des_action_dev = 0.2, adapt_coeff = 1.01):
+    def __init__(self,init_std=0.1, des_action_dev = 0.1, adapt_coeff = 1.01):
         self.current_std = init_std
         self.des_action_dev = des_action_dev
         self.adapt_coeff = adapt_coeff
     
     def adapt(self,action,noisy_action):
-
+        # pdb.set_trace()
         dist = np.linalg.norm(action-noisy_action,axis=-1) #axis = -1 in case there are batched actions in the future
 
         if dist < self.des_action_dev:
@@ -140,7 +155,7 @@ class ParameterSpaceNoise:
         keys = source_policy.state_dict().keys()
         for key in keys:
             # pdb.set_trace()   
-            if 'ln' in key: #ignoring the parameters of layer normalization
+            if 'ln' in key: #ignoring parameters of layer normalization
                 continue
             par = source_policy.state_dict()[key]
             n_par = noisy_policy.state_dict()[key]
@@ -150,7 +165,7 @@ class ParameterSpaceNoise:
 
 
 def train_step(actor_net,critic_net,actor_target_net,critic_target_net,
-                       memory,optimizers,tau,train_batch_size):
+                       memory,optimizers,tau,train_batch_size,total_timesteps,logger):
 
     transitions = memory.sample(train_batch_size)
     batch = Transition(*zip(*transitions))
@@ -178,12 +193,14 @@ def train_step(actor_net,critic_net,actor_target_net,critic_target_net,
     #Updating actor net
     actions_from_actor = actor_net(states)
     actor_loss = - critic_net(states,actions_from_actor).mean()
+    logger.record('Actor Loss',actor_loss,total_timesteps)
     optimizers[0].zero_grad()
     actor_loss.backward()
     
     #clipping gradients     
     for param in actor_net.parameters():
         param.grad.data.clamp_(-1, 1)
+        logger.record('Actor Net Gradient {}'.format(param.name),param.grad.data)
     optimizers[0].step()
     
     #updating target nets
@@ -212,29 +229,59 @@ def add_noise(greedy_action,t,action_max,T,noise_factor,eps_start):
     else:
         return np.random.uniform(low=-action_max,high=action_max
                                  ,size=action.shape)
+class EpsilonGreedy:
+    def __init__(self,eps_start,T,timesteps=0):
+        self.eps_start = eps_start
+        self.T = T
+        self.eps_now = self.eps_start
+    def get_action(self,action,t,action_max):
+        rnd_num = np.random.rand()
+        self.eps_now = self.eps_start*np.exp(-t/self.T)
+        if self.eps_now < rnd_num:
+            return action
+        else:
+            return np.random.uniform(low=-action_max,high=action_max
+                                 ,size=action.shape)
+
 def evaluate_policy(actor_net,normalizer,env):
-    for _ in range(1):
+    for _ in range(3):
         state = env.reset()
         done = False
+        ep_reward = 0
         while not done:
             env.render()
             norm_state = normalizer.normalize(state)
-            action = actor_net(torch.tensor(norm_state)).detach().numpy()* env.action_space.high
+            action = actor_net(torch.tensor(norm_state)).detach().numpy()
             # print(action)
-            print("Mean: ", normalizer.mean,"Std: ",normalizer.std,"state: ", state, "norm_state: ",norm_state, "Action: ",action)
-            next_state,_,done,_ = env.step(action)
+            
+            next_state,r,done,_ = env.step(action)
+            print("state: ", state,  "Action: ",action, "Reward: ", r)
+            ep_reward += r
             state = next_state
+        print("Ep. rew: {}".format(ep_reward))
+
+class Logger:
+    def __init__(self):
+        self.writer = tf.summary.FileWriter('./tb_logdir')
+    def record(self,tag,value,step):
+        summary = tf.Summary(value=[tf.Summary.Value(tag=tag,simple_value=value)])
+        self.writer.add_summary(summary,step)
+        self.writer.flush()
 
 
 def train_ddpg(train_batch_size,noise_factor, eps_start,T,gamma,tau,hidden_layer_size,lr_actor,lr_critic):
 
     start_time = time.time()
+
+    #logger
+    logger = Logger()
+
     #environment
     env = gym.make(env_name)
     action_space_high = env.action_space.high
     
     #initializing class instances
-    actor_net = DDPG_Actor(env.observation_space.shape[0],env.action_space.shape[0])
+    actor_net = DDPG_Actor(env.observation_space.shape[0],env.action_space.shape[0],action_space_high)
     noisy_actor_net = deepcopy(actor_net)
     critic_net = DDPG_Critic(env.observation_space.shape[0],env.action_space.shape[0],1)
     
@@ -252,31 +299,35 @@ def train_ddpg(train_batch_size,noise_factor, eps_start,T,gamma,tau,hidden_layer
     
     normalizer = StateNormalizer(env.observation_space.shape[0])
     param_space_noise = ParameterSpaceNoise()
+    eps_greedy = EpsilonGreedy(eps_start,T)
     total_timesteps = 0
     total_episodes = 0
     rew_list = []
 
     while total_timesteps < max_timesteps:    
+
+        if total_episodes % 25 == 0 and total_episodes != 0:
+            print("Episode: {}, Timesteps: {}".format(total_episodes,total_timesteps))
+            evaluate_policy(actor_net,normalizer,env)
+
+
         state = env.reset()
         ep_reward = 0
-
-        if total_episodes % 20 == 0:
-            evaluate_policy(actor_net,normalizer,env)
 
         for st in range(num_steps):
             
             normalizer.update(state)
             norm_state = normalizer.normalize(state)
             
-            greedy_action = actor_net(torch.tensor(norm_state)).detach().numpy() * action_space_high
-            noisy_greedy_action = noisy_actor_net(torch.tensor(norm_state)).detach().numpy() * action_space_high
-            param_space_noise.adapt(greedy_action/action_space_high , noisy_greedy_action/action_space_high)
+            greedy_action = actor_net(torch.tensor(norm_state)).detach().numpy() 
+            noisy_greedy_action = noisy_actor_net(torch.tensor(norm_state)).detach().numpy() 
+            param_space_noise.adapt(greedy_action , noisy_greedy_action)
             param_space_noise.apply(actor_net,noisy_actor_net)
 
-
-            action = add_noise(noisy_greedy_action,total_timesteps,
-                               env.action_space.high,T,noise_factor,eps_start)
-            # print(action)
+            action = noisy_greedy_action
+            # action = add_noise(noisy_greedy_action,total_timesteps,
+            #                    env.action_space.high,T,noise_factor,eps_start)
+            action = eps_greedy.get_action(action,total_timesteps,env.action_space.high)
             next_state,reward,done,_ = env.step(action)
             next_state = next_state
             
@@ -284,13 +335,27 @@ def train_ddpg(train_batch_size,noise_factor, eps_start,T,gamma,tau,hidden_layer
             memory.push(norm_state,action,reward,norm_next_state,done)
             if train_flag and len(memory)>= train_batch_size:
                 train_step(actor_net,critic_net,actor_target_net,critic_target_net,
-                           memory,optimizers,tau,train_batch_size)
+                           memory,optimizers,tau,train_batch_size,total_timesteps,logger)
             total_timesteps += 1
             ep_reward += reward
-            # env.render()
+
+            '''
+            logging
+            '''
+            logger.record('Reward',reward,total_timesteps)
+            logger.record('Param Noise Std',param_space_noise.current_std,total_timesteps)
+            logger.record('Param Noise Std',param_space_noise.current_std,total_timesteps)
+            logger.record('State Normalizer Mean',normalizer.mean[0],total_timesteps)
+            logger.record('State Normalizer Std',normalizer.std[0],total_timesteps)
+            logger.record('Current Epsilon',eps_greedy.eps_now,total_timesteps)
+
+            '''
+            end logging
+            '''
+
             if done or st == num_steps-1:
                 rew_list.append(ep_reward)
-                print("Timesteps: {}, Reward per step: {}, Steps: {}".format(total_timesteps,ep_reward/st,st))
+                print("Timesteps: {}, Reward per step: {}, Steps: {}".format(total_timesteps,ep_reward/(st+1),st+1))
                 total_episodes += 1
                 break
     end_time = time.time()
