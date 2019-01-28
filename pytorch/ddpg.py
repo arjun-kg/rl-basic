@@ -12,12 +12,12 @@ import pdb
 import time
 import tensorflow as tf 
 
-from parallelize_env_wrapper import ParallelizeEnv
+# from parallelize_env_wrapper import ParallelizeEnv
 
 torch.set_default_tensor_type(torch.DoubleTensor)
 
 #environment name 
-env_name = 'Pendulum-v0'
+env_name = 'MAToyCoverGoals-v0'
 
 #random seed
 np.random.seed(1)
@@ -54,7 +54,8 @@ class ReplayBuffer:
     
     def push(self,s,a,r,ns,d):
 
-        transitions_list = [Transition(a,b,c,d,e) for a,b,c,d,e in zip(s,a,r,ns,d)]
+        # transitions_list = [Transition(a,b,c,d,e) for a,b,c,d,e in zip(s,a,r,ns,d)]
+        transitions_list = [Transition(s,a,r,ns,d)]
         if len(self.buffer) < self.buffer_size:
             self.buffer.append(None)
         list_len = len(transitions_list)
@@ -122,7 +123,7 @@ class StateNormalizer:
         self.count = 0
         self.std = np.ones(size)
 
-    def normalize(self,x,skip=False):
+    def normalize(self,x,skip=True):
         if skip:
             return x
         return (x - self.mean)/(self.std+1e-4) #1e-4 is to avoid blow up
@@ -200,7 +201,7 @@ def train_step(actor_net,critic_net,actor_target_net,critic_target_net,
     #clipping gradients     
     for param in actor_net.parameters():
         param.grad.data.clamp_(-1, 1)
-        logger.record('Actor Net Gradient {}'.format(param.name),param.grad.data)
+        # logger.record('Actor Net Gradient {}'.format(param.name),param.grad.data)
     optimizers[0].step()
     
     #updating target nets
@@ -255,7 +256,7 @@ def evaluate_policy(actor_net,normalizer,env):
             # print(action)
             
             next_state,r,done,_ = env.step(action)
-            print("state: ", state,  "Action: ",action, "Reward: ", r)
+            # print("state: ", state,  "Action: ",action, "Reward: ", r)
             ep_reward += r
             state = next_state
         print("Ep. rew: {}".format(ep_reward))
@@ -329,7 +330,7 @@ def train_ddpg(train_batch_size,noise_factor, eps_start,T,gamma,tau,hidden_layer
             #                    env.action_space.high,T,noise_factor,eps_start)
             action = eps_greedy.get_action(action,total_timesteps,env.action_space.high)
             next_state,reward,done,_ = env.step(action)
-            next_state = next_state
+            state = next_state
             
             norm_next_state = normalizer.normalize(next_state)
             memory.push(norm_state,action,reward,norm_next_state,done)
